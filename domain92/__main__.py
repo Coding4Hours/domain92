@@ -9,6 +9,7 @@ from art import *
 import freedns
 import sys
 import argparse
+import json
 import pytesseract
 import copy
 from PIL import ImageFilter
@@ -17,6 +18,9 @@ import platform
 from importlib.metadata import version
 import lolpython
 import time
+import aiohttp
+import asyncio
+import re
 
 parser = argparse.ArgumentParser(
     description="Automatically creates links for an ip on freedns"
@@ -86,6 +90,17 @@ client = freedns.Client()
 checkprint("client initialized")
 
 
+def fetch(sp):
+    """Fetch HTML for a single page using session and return matches."""
+    with req.Session() as session:
+        html = session.get(
+            f"https://freedns.afraid.org/domain/registry/?page={sp}&sort=2&q=",
+            headers=get_headers(),
+            timeout=10
+        ).text
+    matches = domain_pattern.findall(html)
+    return matches
+
 def get_data_path():
     script_dir = os.path.dirname(__file__)
     checkprint("checking os")
@@ -115,7 +130,12 @@ checkprint("getting ip list")
 iplist = req.get(
     "https://raw.githubusercontent.com/sebastian-92/byod-ip/refs/heads/master/byod.json"
 ).text
-iplist = eval(iplist)
+
+iplist = re.sub(r",\s*}", "}", iplist)
+iplist = re.sub(r",\s*]", "]", iplist)
+
+
+iplist = json.loads(iplist)
 
 
 def getpagelist(arg):
@@ -155,35 +175,46 @@ def getpagelist(arg):
         return [int(arg)]
 
 
-def getdomains(arg):
-    global domainlist, domainnames
-    for sp in getpagelist(arg):
-        checkprint("getting page " + str(sp))
-        html = req.get(
-            "https://freedns.afraid.org/domain/registry/?page="
-            + str(sp)
-            + "&sort=2&q=",
-            headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Cache-Control": "max-age=0",
-                "Connection": "keep-alive",
-                "DNT": "1",
-                "Host": "freedns.afraid.org",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Upgrade-Insecure-Requests": "1",
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-                "sec-ch-ua": '"Not;A=Brand";v="24", "Chromium";v="128"',
-                "sec-ch-ua-platform": "Linux",
-            },
-        ).text
-        pattern = r"<a href=\/subdomain\/edit\.php\?edit_domain_id=(\d+)>([\w.-]+)<\/a>(.+\..+)<td>public<\/td>"
-        matches = re.findall(pattern, html)
-        domainnames.extend([match[1] for match in matches])
-        domainlist.extend([match[0] for match in matches])
+
+async def getdomains(pages):
+    domainlist = []
+    domainnames = []
+    pattern = re.compile(
+        r"<a href=\/subdomain\/edit\.php\?edit_domain_id=(\d+)>([\w.-]+)<\/a>(.+\..+)<td>public<\/td>"
+    )
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "max-age=0",
+        "Connection": "keep-alive",
+        "DNT": "1",
+        "Host": "freedns.afraid.org",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "sec-ch-ua": '"Not;A=Brand";v="24", "Chromium";v="128"',
+        "sec-ch-ua-platform": "Linux",
+    }
+
+    async with aiohttp.ClientSession(headers=headers) as session:
+        tasks = []
+        for page in pages:
+            tasks.append(session.get(f"https://freedns.afraid.org/domain/registry/?page={page}&sort=2&q="))
+
+        responses = await asyncio.gather(*tasks)
+        for resp in responses:
+            html = await resp.text()
+            matches = pattern.findall(html)
+            domainnames.extend([m[1] for m in matches])
+            domainlist.extend([m[0] for m in matches])
+
+    return domainlist, domainnames
+
+
+
 
 
 def find_domain_id(domain_name):
@@ -498,13 +529,26 @@ def createdomain():
 non_random_domain_id = None
 
 
-def finddomains(pagearg):
+async def finddomains(pagearg):
     pages = pagearg.split(",")
-    for page in pages:
-        getdomains(page)
+
+    # Start all requests as tasks immediately
+    tasks = [asyncio.create_task(getdomains(page)) for page in pages]
+
+    # Await them all at once
+    results = await asyncio.gather(*tasks)
+
+    # Flatten results if getdomains returns (domainlist, domainnames)
+    domainlist = []
+    domainnames = []
+    for dl, dn in results:
+        domainlist.extend(dl)
+        domainnames.extend(dn)
+
+    return domainlist, domainnames
 
 
-def init():
+async def iniit():
     global args, ip, iplist, webhook, hookbool, non_random_domain_id
     if not args.ip:
         chosen = chooseFrom(iplist, "Choose an IP to use:")
@@ -623,7 +667,7 @@ def init():
         non_random_domain_id = find_domain_id(args.single_tld)
         checkprint(f"Using single domain ID: {non_random_domain_id}")
     else:
-        finddomains(args.pages)
+        await finddomains(args.pages)
 
     if args.number:
         createlinks(args.number)
@@ -636,6 +680,8 @@ def chooseFrom(dictionary, message):
     choice = int(input("Choose an option by number: "))
     return list(dictionary.keys())[choice - 1]
 
+def init():
+    asyncio.run(iniit())
 
 if __name__ == "__main__":
     init()
